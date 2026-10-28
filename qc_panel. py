@@ -1,0 +1,1378 @@
+# qc_panel.py  -> put in ~/.nuke (or any NUKE_PATH folder)
+# (c)renjith kallinal
+# menu.py:  import qc_panel; qc_panel.register()
+import math
+import os
+import re
+import tempfile
+import traceback
+
+import nuke
+import nukescripts
+
+try:
+    from PySide6 import QtWidgets as W, QtCore as C, QtGui as G
+except ImportError:
+    from PySide2 import QtWidgets as W, QtCore as C, QtGui as G
+
+# ----------------------------------------------------------------- config
+START_FRAME = 1001
+ALLOWED_COMP = ('zip', 'piz', 'dwa')          # exr compression (lowercase substrings)
+ALLOWED_BITS = ('16', '32')                   # exr bits per channel
+# shotname_V##.####.exr | shotname_V##_####.exr | same with .dpx | V### (3 digit version) too
+NAME_RE = re.compile(r'^[A-Za-z0-9][A-Za-z0-9_]*?_V(\d{2,3})[._](\d{4}|%04d|#{4})\.(exr|dpx)$')
+CHECK_START = True      # False = do not mark Start red when it is not START_FRAME
+VER_RE = re.compile(r'^(.*)[_.][vV]\d+$')     # trailing version token on a name base
+DARK_LEVEL = 0.02
+BRIGHT_LEVEL = 0.90
+CLIP_TOL = 0.001
+SUPERBRIGHT = 1.001
+DEAD_THRESH = 0.2
+CLIP_WARN_PCT = 0.5
+AUTHOR = '(c)renjith kallinal'
+# channel layers counted as DI mattes (case-insensitive regex on layer name)
+MATTE_RE = re.compile(r'(^di[_\-. ]|^di$|matte)', re.I)
+SKIP_LAYERS = ('rgba', 'rgb', 'depth', 'forward', 'backward', 'motion')
+MATTE_COLORS = {'Red': (1, 0, 0), 'Green': (0, 1, 0), 'Blue': (0, 0, 1),
+                'Yellow': (1, 1, 0), 'Magenta': (1, 0, 1), 'Cyan': (0, 1, 1)}
+# output vs input tolerance per metric: (absolute, relative). Within tolerance = green, else red.
+TOL = {'black': (0.002, 0.05), 'white': (0.01, 0.02), 'dark': (0.05, 0.10), 'bright': (0.05, 0.10), 'sat': (0.01, 0.05),
+       'clip': (0.05, 0.10), 'grain': (0.02, 0.15)}
+
+
+def same(key, a, b):
+    ab, rel = TOL[key]
+    return abs(a - b) <= max(ab, rel * max(abs(a), abs(b)))
+
+HEAD = ['Shot', 'Input', 'Output', 'Ver', 'Name', 'Ext', 'Compression', 'Bits', 'Colorspace',
+        'Length', 'Start', 'Res', 'BBox', 'DI Matte', 'In/Out',
+        'Black', 'White', 'Dark %', 'Bright %', 'Sat', 'Clip %', 'Grain', 'Neg %', 'Dead px',
+        'Superbright %', 'Diff']
+EXR_COMP = {'0': 'none', '1': 'rle', '2': 'zip (1 scanline)', '3': 'zip (16 scanlines)', '4': 'piz',
+            '5': 'pxr24', '6': 'b44', '7': 'b44a', '8': 'dwaa', '9': 'dwab'}
+COL = dict((h, i) for i, h in enumerate(HEAD))
+GOOD, BAD, WARN = G.QColor(55, 105, 55), G.QColor(140, 50, 50), G.QColor(150, 110, 40)
+ROLE = C.Qt.ItemDataRole.UserRole
+
+
+TOOL_NK = r'''set cut_paste_input [stack 0]
+version 10.0 v5
+push $cut_paste_input
+Group {
+ name QC_Tool1
+ tile_color 0xffaaaaff
+ selected true
+ xpos -33901
+ ypos 12627
+ addUserKnob {20 user l QC}
+ addUserKnob {41 QCMethod T Switch2.which}
+ addUserKnob {26 ""}
+ addUserKnob {26 Instructions l "" +STARTLINE T "0 = Check Darks\n1 = Check Saturation\n2 = Check Brights\n3 = Check Clipping\n4 = Check Grain 1\n5 = Check Grain 2\n6 = Check Negative Values\n7 = Check Super Brights"}
+ addUserKnob {26 ""}
+ addUserKnob {26 babu l " " T babuap@gmail.com}
+}
+ BackdropNode {
+  inputs 0
+  name Noise_check
+  tile_color 0xa36434ff
+  label "Noise check"
+  note_font_size 42
+  xpos 1444
+  ypos 495
+  bdwidth 280
+  bdheight 204
+ }
+ Input {
+  inputs 0
+  name Input1
+  xpos 488
+  ypos 314
+ }
+ Dot {
+  name Dot119
+  xpos 522
+  ypos 354
+ }
+set N503d9000 [stack 0]
+ Dot {
+  name Dot120
+  xpos 657
+  ypos 354
+ }
+set N503d8c00 [stack 0]
+ Dot {
+  name Dot122
+  xpos 799
+  ypos 354
+ }
+set N503d8800 [stack 0]
+ Dot {
+  name Dot48
+  xpos 1265
+  ypos 354
+ }
+set N503d8400 [stack 0]
+ Dot {
+  name Dot11
+  xpos 1468
+  ypos 354
+ }
+set N503d8000 [stack 0]
+ Dot {
+  name Dot64
+  xpos 1928
+  ypos 354
+ }
+set N50401c00 [stack 0]
+ Dot {
+  name Dotl
+  xpos 2227
+  ypos 354
+ }
+set N50401800 [stack 0]
+ Dot {
+  name Dot5
+  xpos 2426
+  ypos 354
+ }
+ Dot {
+  name Dot8
+  xpos 2426
+  ypos 578
+ }
+set N50401000 [stack 0]
+ Dot {
+  name Dot1
+  xpos 2659
+  ypos 578
+ }
+ Dot {
+  name Dot7
+  xpos 2659
+  ypos 720
+ }
+push $N50401000
+ ClipTest {
+  upper 55
+  name ClipTest1
+  xpos 2392
+  ypos 624
+ }
+ Merge2 {
+  inputs 2
+  operation difference
+  name Mergel
+  xpos 2392
+  ypos 717
+ }
+ Multiply {
+  value 20
+  name Multiply1
+  xpos 2392
+  ypos 781
+ }
+ Dot {
+  name Dot6
+  xpos 2426
+  ypos 971
+ }
+push $N50401800
+ Expression {
+  expr0 "r < 0 ? 1 : 0"
+  expr1 "g < 0 ? 1 : 0"
+  expr2 "b < 0 ? 1 : 0"
+  name Negative_Pixel_Checker
+  xpos 2193
+  ypos 581
+ }
+ Dot {
+  name Dot2
+  xpos 2227
+  ypos 971
+ }
+push $N503d8000
+ Dot {
+  name Dot10
+  label connect
+  xpos 1468
+  ypos 566
+ }
+set N50422800 [stack 0]
+ Group {
+  name QC_noise
+  xpos 1434
+  ypos 735
+  addUserKnob {20 User}
+  addUserKnob {41 size T Blur15.size}
+  addUserKnob {41 multiply T Grade10.multiply}
+  addUserKnob {41 white l gain T Grade10.white}
+ }
+  Input {
+   inputs 0
+   name Input1
+   xpos 670
+   ypos 451
+  }
+  Dot {
+   name Dot561
+   xpos 704
+   ypos 491
+  }
+  Dot {
+   name Dot562
+   xpos 704
+   ypos 539
+  }
+set N50449c00 [stack 0]
+  Dot {
+   name Dot563
+   xpos 594
+   ypos 539
+  }
+  Dot {
+   name Dot564
+   xpos 594
+   ypos 659
+  }
+push $N50449c00
+  Blur {
+   size 0.7
+   name Blur15
+   xpos 670
+   ypos 577
+  }
+  Merge2 {
+   inputs 2
+   operation minus
+   name Merge1
+   xpos 670
+   ypos 655
+  }
+  Grade {
+   channels all
+   white 27
+   multiply 100
+   gamma 0.79
+   white_clamp true
+   name Grade10
+   xpos 670
+   ypos 697
+  }
+  Output {
+   name Output1
+   xpos 670
+   ypos 797
+  }
+ end_group
+push $N50401c00
+ Dot {
+  name Dotl10
+  xpos 1928
+  ypos 566
+ }
+set N50448000 [stack 0]
+ Dot {
+  name Dotl11
+  xpos 1800
+  ypos 566
+ }
+ Blur {
+  channels rgba
+  size 1
+  name Blur6
+  xpos 1766
+  ypos 614
+ }
+ Dot {
+  name Dot148
+  xpos 1800
+  ypos 660
+ }
+push $N50448000
+ Merge2 {
+  inputs 2
+  operation from
+  bbox B
+  output rgb
+  name Merge18
+  xpos 1894
+  ypos 657
+ }
+ Grade {
+  white 200
+  name Grade2
+  xpos 1894
+  ypos 721
+ }
+push $N50448000
+ Dot {
+  name Dot9
+  xpos 2061
+  ypos 566
+ }
+ Merge2 {
+  inputs 2
+  operation plus
+  bbox B
+  output rgb
+  name Merge19
+  xpos 2025
+  ypos 721
+ }
+ Dot {
+  name Dot12
+  xpos 2059
+  ypos 971
+ }
+push $N503d8400
+ Dot {
+  name Dot16
+  xpos 1265
+  ypos 573
+ }
+set N504abc00 [stack 0]
+push $N504abc00
+ Dot {
+  name Dot15
+  xpos 1097
+  ypos 573
+ }
+ Grade {
+  white 0
+  name Grade3
+  xpos 1063
+  ypos 665
+ }
+ Dot {
+  name Dot14
+  xpos 1097
+  ypos 746
+ }
+ Dissolve {
+  inputs 2
+  which 0.86
+  name Dissolve1
+  xpos 1231
+  ypos 738
+ }
+push $N503d8800
+ Grade {
+  white 0.05
+  black_clamp false
+  name Gradel
+  xpos 765
+  ypos 567
+ }
+ Dot {
+  name Dot13
+  xpos 799
+  ypos 971
+ }
+push $N503d8c00
+ Saturation {
+  saturation 4
+  name Saturation1
+  xpos 623
+  ypos 567
+ }
+ Dot {
+  name Dot4
+  xpos 657
+  ypos 971
+ }
+push $N503d9000
+ Colorspace {
+  colorspace_out SLog3
+  name Colorspace1
+  xpos 488
+  ypos 571
+ }
+ Dot {
+  name Dot3
+  xpos 522
+  ypos 971
+ }
+ Switch {
+  inputs 8
+  which 5.08
+  name Switch2
+  xpos 1231
+  ypos 968
+ }
+ Output {
+  name Output1
+  xpos 1231
+  ypos 1051
+ }
+push $N50422800
+ Blur {
+  channels rgba
+  size 1
+  name Blur2
+  xpos 1578
+  ypos 563
+ }
+push $N50422800
+ Merge2 {
+  inputs 2
+  operation minus
+  name Merge4
+  xpos 1578
+  ypos 630
+ }
+ EXPTool {
+  red 2.123
+  green 2.123
+  blue 2.123
+  name Exposure1
+  xpos 1578
+  ypos 675
+ }
+ StickyNote {
+  inputs 0
+  name stickyNote2
+  label "Check Saturation"
+  xpos 617
+  ypos 472
+ }
+ StickyNote {
+  inputs 0
+  name StickyNote3
+  label "Check Brights"
+  xpos 764
+  ypos 474
+ }
+ StickyNote {
+  inputs 0
+  name StickyNote4
+  label "Check clipping"
+  xpos 1234
+  ypos 459
+ }
+ StickyNote {
+  inputs 0
+  name StickyNote5
+  label "Check Grain 2"
+  xpos 1434
+  ypos 459
+ }
+ StickyNote {
+  inputs 0
+  name StickyNote6
+  label "Check Grain "
+  xpos 1894
+  ypos 459
+ }
+ StickyNote {
+  inputs 0
+  name StickyNote8
+  label "Check Superbrights"
+  xpos 2400
+  ypos 475
+ }
+ StickyNote {
+  inputs 0
+  name StickyNote7
+  label "Check Negative Pixels"
+  xpos 2193
+  ypos 477
+ }
+ StickyNote {
+  inputs 0
+  name StickyNote1
+  label "Check Blacks"
+  xpos 485
+  ypos 478
+ }
+end_group
+'''
+
+METHODS = ['Darks', 'Saturation', 'Brights', 'Clipping', 'Grain 1', 'Grain 2', 'Negative', 'Super bright']
+VIEWS = ['Input QC', 'Output QC', 'Difference', 'Wipe', 'Matte', 'Matte on Input']
+# (label, node path inside QC group, knob, min, max, default, method index)  defaults = QC_Tool.nk values
+SLIDERS = [
+    ('Dark gain',         'Dark_gain',        'multiply',   0.1,   20.0,   1.0,   0),
+    ('Saturation boost',  'Saturation1',      'saturation', 1.0,   20.0,   4.0,   1),
+    ('Brights white',     'Gradel',           'white',      0.001, 2.0,    0.05,  2),
+    ('Clipping mix',      'Dissolve1',        'which',      0.0,   1.0,    0.86,  3),
+    ('Grain1 blur',       'Blur6',            'size',       0.1,   10.0,   1.0,   4),
+    ('Grain1 white',      'Grade2',           'white',      1.0,   1000.0, 200.0, 4),
+    ('Grain2 blur',       'QC_noise.Blur15',  'size',       0.1,   10.0,   0.7,   5),
+    ('Grain2 multiply',   'QC_noise.Grade10', 'multiply',   1.0,   500.0,  100.0, 5),
+    ('Grain2 gain',       'QC_noise.Grade10', 'white',      1.0,   100.0,  27.0,  5),
+    ('Superbright level', 'ClipTest1',        'upper',      0.5,   100.0,  55.0,  7),
+    ('Superbright amp',   'Multiply1',        'value',      1.0,   100.0,  20.0,  7),
+]
+
+
+class ParamRow(W.QWidget):
+    """label + slider + spinbox"""
+    def __init__(self, label, lo, hi, default, cb):
+        super(ParamRow, self).__init__()
+        self.lo, self.hi, self.cb, self.default = lo, hi, cb, default
+        lay = W.QHBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        l = W.QLabel(label)
+        l.setMinimumWidth(110)
+        lay.addWidget(l)
+        self.sl = W.QSlider(C.Qt.Orientation.Horizontal)
+        self.sl.setRange(0, 1000)
+        lay.addWidget(self.sl, 1)
+        self.sp = W.QDoubleSpinBox()
+        self.sp.setDecimals(3)
+        self.sp.setRange(lo, hi)
+        self.sp.setSingleStep((hi - lo) / 100.0)
+        self.sp.setMinimumWidth(80)
+        lay.addWidget(self.sp)
+        self.set(default, emit=False)
+        self.sl.valueChanged.connect(self._from_slider)
+        self.sp.valueChanged.connect(self._from_spin)
+
+    def value(self):
+        return self.sp.value()
+
+    def set(self, v, emit=True):
+        self.sp.blockSignals(True)
+        self.sl.blockSignals(True)
+        self.sp.setValue(v)
+        self.sl.setValue(int(round(1000.0 * (v - self.lo) / (self.hi - self.lo))))
+        self.sp.blockSignals(False)
+        self.sl.blockSignals(False)
+        if emit:
+            self.cb(v)
+
+    def _from_slider(self, i):
+        self.set(self.lo + (self.hi - self.lo) * i / 1000.0)
+
+    def _from_spin(self, v):
+        self.set(v)
+
+
+# ----------------------------------------------------------------- helpers
+def meta(n, key):
+    try:
+        md = n.metadata()
+    except Exception:
+        return ''
+    for k in sorted(md, key=len):
+        if key in k.lower():
+            return str(md[k])
+    return ''
+
+
+def fname(n):
+    return os.path.basename(n['file'].value()) if 'file' in n.knobs() else ''
+
+
+def base_of(n):
+    """file name without extension and frame number: A_v001_V01.0001.exr -> A_v001_V01"""
+    f = os.path.splitext(fname(n))[0]
+    return re.sub(r'[._](\d+|%\d*d|#+)$', '', f)
+
+
+def find_pairs(nodes):
+    """{output fullName: input node or None}. Output = its base is an input's base + trailing version
+    token (A_v001 -> A_v001_V01). Fallback: name matches shot_Name_V##_####.ext but no input found."""
+    bases = {}
+    for n in nodes:
+        bases.setdefault(base_of(n), []).append(n)
+    pairs = {}
+    for n in nodes:
+        m = VER_RE.match(base_of(n))
+        cand = [x for x in bases.get(m.group(1), []) if x is not n] if m else []
+        if cand:
+            pairs[n.fullName()] = cand[0]
+        elif NAME_RE.match(fname(n)):
+            pairs[n.fullName()] = None
+    return pairs
+
+
+def find_mattes(n):
+    """full channel names of every matte in node n.
+    Any extra layer next to rgba counts (rain.matte, bg_rain.matte, other.bg_rain, DI_sky.alpha ...);
+    colour layers (red+green+blue, e.g. AOVs) are skipped unless their layer name looks like a matte."""
+    try:
+        chans = list(n.channels())
+    except Exception:
+        return []
+    layers = {}
+    for c in chans:
+        l, _, suf = c.partition('.')
+        layers.setdefault(l, []).append(c)
+    out = []
+    for l in sorted(layers):
+        if l.lower() in SKIP_LAYERS:
+            continue
+        sufs = set(c.partition('.')[2].lower() for c in layers[l])
+        out.extend(sorted(layers[l]))                  # every channel of the layer can be a matte
+    return out                                         # (rain.matte, rain.red, rain.alpha ...)
+
+
+def matte_pick(chans):
+    """preferred channel of a layer: matte > alpha > red > first"""
+    for pref in ('matte', 'alpha', 'red'):
+        for c in chans:
+            if c.partition('.')[2].lower() == pref:
+                return c
+    return chans[0]
+
+
+def matte_copy(node, chan):
+    """point a Copy node (inputs: B=A=render) so the matte channel lands in rgba.r/g/b/a"""
+    for i, to in enumerate(('rgba.red', 'rgba.green', 'rgba.blue', 'rgba.alpha')):
+        node['from%d' % i].setValue(chan)
+        node['to%d' % i].setValue(to)
+
+
+def info(n):
+    k = n.knobs()
+    is_write = n.Class() == 'Write'
+    base = fname(n)
+    ext = os.path.splitext(base)[1].lstrip('.').lower()
+    m = NAME_RE.match(base)
+    v = re.search(r'_V(\d+)', base)
+    fmt = n.format()
+    bb = n.bbox()
+    first = int(n['first'].value()) if 'first' in k else int(nuke.root().firstFrame())
+    last = int(n['last'].value()) if 'last' in k else int(nuke.root().lastFrame())
+    comp = bits = ''
+    if ext == 'exr':
+        comp = n['compression'].value() if is_write and 'compression' in k else \
+            (meta(n, 'compressionname') or meta(n, 'compression'))
+        comp = EXR_COMP.get(comp.strip(), comp)
+        bits = n['datatype'].value() if is_write and 'datatype' in k else \
+            (meta(n, 'bitsperchannel') or meta(n, 'bitdepth'))
+    return dict(
+        file=base, ver='V' + v.group(1) if v else '-', name_ok=bool(m), ext=ext,
+        comp=comp, bits=bits,
+        cs=n['colorspace'].value() if 'colorspace' in k else '',
+        first=first, last=last, length=last - first + 1,
+        w=fmt.width(), h=fmt.height(),
+        bbox=(int(bb.x()), int(bb.y()), int(bb.x() + bb.w()), int(bb.y() + bb.h())),
+        mattes=find_mattes(n),
+    )
+
+
+def _undo(off):
+    try:
+        nuke.Undo.disable() if off else nuke.Undo.enable()
+    except Exception:
+        pass
+
+
+def analyse(n, frame):
+    fmt = n.format()
+    w, h = fmt.width(), fmt.height()
+    cx, cy = w / 2.0, h / 2.0
+    made = []
+
+    def mk(cls, *inputs, **kn):
+        x = getattr(nuke.nodes, cls)(inputs=list(inputs), **kn)
+        made.append(x)
+        return x
+
+    def avg(x, chans='rgb'):
+        return sum(x.sample(c, cx, cy, w, h) for c in chans) / float(len(chans))
+
+    def mask(src, expr):
+        e = mk('Expression', src, channel0='rgb', channel1='none', channel2='none',
+               channel3='none', expr0='(%s)?1:0' % expr)
+        return avg(e, 'r')
+
+    L = '(0.2126*r+0.7152*g+0.0722*b)'
+    mx, mn = 'max(r,max(g,b))', 'min(r,min(g,b))'
+    old = nuke.frame()
+    _undo(True)
+    try:
+        nuke.frame(frame)
+        out = {}
+        out['dark'] = 100 * mask(n, '%s<%f' % (L, DARK_LEVEL))
+        out['bright'] = 100 * mask(n, '%s>%f' % (L, BRIGHT_LEVEL))
+        e = mk('Expression', n, channel0='rgb', channel1='none', channel2='none',
+               channel3='none', expr0='(%s-%s)/max(%s,0.0001)' % (mx, mn, mx))
+        out['sat'] = avg(e, 'r')
+        out['clip'] = 100 * mask(n, ' || '.join('abs(%s-1)<%f' % (c, CLIP_TOL) for c in 'rgb'))
+        out['neg'] = 100 * mask(n, ' || '.join('%s<-0.0001' % c for c in 'rgb'))
+        out['super'] = 100 * mask(n, ' || '.join('%s>%f' % (c, SUPERBRIGHT) for c in 'rgb'))
+        def extreme(op):
+            """real min/max over R,G,B and the whole frame: log2 reduction with Transform + Merge(min/max)"""
+            cur = mk('Expression', n, channel0='rgb', channel1='none', channel2='none',
+                     channel3='none', expr0='%s(r,%s(g,b))' % (op, op))
+            for axis, size in ((0, w), (1, h)):
+                for k in range(int(math.ceil(math.log(max(size, 2), 2)))):
+                    t = mk('Transform', cur, filter='impulse')
+                    t['translate'].setValue(-(2 ** k) if axis == 0 else 0, 0)
+                    t['translate'].setValue(-(2 ** k) if axis == 1 else 0, 1)
+                    try:
+                        t['black_outside'].setValue(False)      # extend edge pixels, never add black
+                    except Exception:
+                        pass
+                    cur = mk('Merge2', cur, t, operation=op)
+            return cur.sample('r', 0, 0)
+
+        out['black'] = extreme('min')
+        out['white'] = extreme('max')
+        bl = mk('Blur', n, size=2)
+        out['grain'] = avg(mk('Merge2', n, bl, operation='difference')) * 100
+        md = mk('Median', n, size=3)
+        df = mk('Merge2', n, md, operation='difference')
+        out['dead'] = int(round(mask(df, ' || '.join('%s>%f' % (c, DEAD_THRESH) for c in 'rgb')) * w * h))
+        return out
+    finally:
+        for x in made:
+            try:
+                nuke.delete(x)
+            except Exception:
+                pass
+        nuke.frame(old)
+        _undo(False)
+
+
+def matte_stats(n, layer, frame):
+    """coverage / mean / negative / over-1 for one matte layer of node n"""
+    fmt = n.format()
+    w, h = fmt.width(), fmt.height()
+    cx, cy = w / 2.0, h / 2.0
+    made = []
+    old = nuke.frame()
+    _undo(True)
+    try:
+        nuke.frame(frame)
+        sh = nuke.nodes.Copy(inputs=[n, n])
+        made.append(sh)
+        matte_copy(sh, layer)
+
+        def avg(x):
+            return x.sample('r', cx, cy, w, h)
+
+        def mask(expr):
+            e = nuke.nodes.Expression(inputs=[sh], channel0='rgb', channel1='none', channel2='none',
+                                      channel3='none', expr0='(%s)?1:0' % expr)
+            made.append(e)
+            return avg(e)
+
+        return dict(mean=avg(sh), cover=100 * mask('r>0.001'), neg=100 * mask('r<-0.0001'),
+                    over=100 * mask('r>1.001'))
+    finally:
+        for x in made:
+            try:
+                nuke.delete(x)
+            except Exception:
+                pass
+        nuke.frame(old)
+        _undo(False)
+
+
+def compare(a, b, frame):
+    """a = input, b = output. Returns (lines, short diff text)."""
+    ia, ib = info(a), info(b)
+    lines = []
+    same_res = (ia['w'], ia['h']) == (ib['w'], ib['h'])
+    lines.append('Res %s: %dx%d vs %dx%d' % ('OK' if same_res else 'MISMATCH', ia['w'], ia['h'], ib['w'], ib['h']))
+    lines.append('BBox %s: %s vs %s' % ('OK' if ia['bbox'] == ib['bbox'] else 'MISMATCH', ia['bbox'], ib['bbox']))
+    lines.append('Length %s: %d vs %d' % ('OK' if ia['length'] == ib['length'] else 'MISMATCH', ia['length'], ib['length']))
+    short = ''
+    if same_res:
+        made = []
+        old = nuke.frame()
+        _undo(True)
+        try:
+            nuke.frame(frame)
+            d = nuke.nodes.Merge2(inputs=[a, b], operation='difference')
+            made.append(d)
+            cx, cy, w, h = ia['w'] / 2.0, ia['h'] / 2.0, ia['w'], ia['h']
+            mean = sum(d.sample(c, cx, cy, w, h) for c in 'rgb') / 3.0
+            e = nuke.nodes.Expression(inputs=[d], channel0='rgb', channel1='none', channel2='none',
+                                      channel3='none', expr0='(r>0.001||g>0.001||b>0.001)?1:0')
+            made.append(e)
+            pct = 100 * e.sample('r', cx, cy, w, h)
+            lines.append('Diff mean %.6f | %.3f%% px differ (f%d)' % (mean, pct, frame))
+            short = '%.5f / %.2f%%' % (mean, pct)
+        finally:
+            for x in made:
+                nuke.delete(x)
+            nuke.frame(old)
+            _undo(False)
+    return lines, short
+
+
+# ----------------------------------------------------------------- panel
+class QCPanel(W.QWidget):
+    GRP = 'QC_Compare'          # the ONE node created in the node graph
+
+    def __init__(self):
+        super(QCPanel, self).__init__()
+        self._busy = False
+        self._last_sel = None
+        self.method = 0
+        self.view = 0
+        lay = W.QVBoxLayout(self)
+
+        # ---- top bar
+        bar = W.QHBoxLayout()
+        for text, fn in (('Scan All Reads', lambda: self.scan()),
+                         ('Scan Selected', self.scan_selected),
+                         ('Remove Row', self.remove_rows),
+                         ('Remove No-Output', self.remove_missing),
+                         ('Check In/Out', self.check_inout),
+                         ('Image Stats', self.run_analysis)):
+            b = W.QPushButton(text)
+            b.clicked.connect(self._safe(fn))
+            bar.addWidget(b)
+        bar.addWidget(W.QLabel('Frame (0=mid):'))
+        self.frame = W.QSpinBox()
+        self.frame.setRange(0, 999999)
+        bar.addWidget(self.frame)
+        self.sync = W.QCheckBox('Sync graph')
+        self.sync.setChecked(True)
+        bar.addWidget(self.sync)
+        bar.addStretch()
+        lay.addLayout(bar)
+
+        # ---- pair table: one row = Input + its Output
+        self.t = W.QTableWidget(0, len(HEAD))
+        self.t.setHorizontalHeaderLabels(HEAD)
+        self.t.setSelectionBehavior(W.QAbstractItemView.SelectionBehavior.SelectRows)
+        self.t.setSelectionMode(W.QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.t.setAlternatingRowColors(True)
+        self.t.horizontalHeader().setStretchLastSection(True)
+        self.t.itemSelectionChanged.connect(self._table_sel)
+        lay.addWidget(self.t, 1)
+
+        # ---- QC view controls
+        box = W.QGroupBox('QC View  (builds ONE node "%s" in the node graph)' % self.GRP)
+        bl = W.QVBoxLayout(box)
+        r = W.QHBoxLayout()
+        b = W.QPushButton('QC View for selected row')
+        b.clicked.connect(self._safe(self.qc_selected))
+        r.addWidget(b)
+        b = W.QPushButton('Remove QC')
+        b.clicked.connect(self._safe(self.remove_qc))
+        r.addWidget(b)
+        b = W.QPushButton('Reset sliders')
+        b.clicked.connect(self._safe(self.reset_sliders))
+        r.addWidget(b)
+        self.auto = W.QCheckBox('Auto QC on row select')
+        r.addWidget(self.auto)
+        r.addStretch()
+        bl.addLayout(r)
+
+        bl.addLayout(self._toggles('Check:', METHODS, self.set_method))
+        bl.addLayout(self._toggles('View:', VIEWS, self.set_view))
+        self.matte_box = W.QWidget()
+        mr = W.QHBoxLayout(self.matte_box)
+        mr.setContentsMargins(0, 0, 0, 0)
+        mr.addWidget(W.QLabel('DI Matte:'))
+        self.matte = W.QComboBox()
+        self.matte.setMinimumWidth(180)
+        self.matte.currentIndexChanged.connect(lambda i: self._run(self.set_matte))
+        mr.addWidget(self.matte)
+        b = W.QPushButton('Check Matte')
+        b.clicked.connect(self._safe(lambda: self.check_matte(False)))
+        mr.addWidget(b)
+        b = W.QPushButton('Check All Mattes')
+        b.clicked.connect(self._safe(lambda: self.check_matte(True)))
+        mr.addWidget(b)
+        mr.addWidget(W.QLabel('Overlay color:'))
+        self.mcolor = W.QComboBox()
+        self.mcolor.addItems(list(MATTE_COLORS))
+        self.mcolor.currentIndexChanged.connect(lambda i: self._run(self.set_overlay))
+        mr.addWidget(self.mcolor)
+        mr.addWidget(W.QLabel('Opacity:'))
+        self.mop = W.QDoubleSpinBox()
+        self.mop.setRange(0.0, 1.0)
+        self.mop.setSingleStep(0.1)
+        self.mop.setValue(0.6)
+        self.mop.valueChanged.connect(lambda v: self._run(self.set_overlay))
+        mr.addWidget(self.mop)
+        mr.addStretch()
+        bl.addWidget(self.matte_box)
+
+        self.rows = []
+        for sp in SLIDERS:
+            row = ParamRow(sp[0], sp[3], sp[4], sp[5],
+                           lambda v, sp=sp: self._run(lambda: self.set_knob(sp[1], sp[2], v)))
+            row.method = sp[6]
+            self.rows.append(row)
+            bl.addWidget(row)
+        self.wipe = ParamRow('Wipe position %', 0, 100, 50, lambda v: self._run(lambda: self.set_wipe(v)))
+        self.dgain = ParamRow('Diff gain', 1, 100, 10, lambda v: self._run(lambda: self.set_dgain(v)))
+        bl.addWidget(self.wipe)
+        bl.addWidget(self.dgain)
+        lay.addWidget(box)
+
+        self.result = W.QLabel('Click "Scan All Reads". One row = Input + its Output.')
+        self.result.setTextInteractionFlags(C.Qt.TextInteractionFlag.TextSelectableByMouse)
+        self.result.setWordWrap(True)
+        foot = W.QHBoxLayout()
+        foot.addWidget(self.result, 1)
+        cr = W.QLabel(AUTHOR)
+        f = cr.font()
+        f.setPointSize(7)
+        cr.setFont(f)
+        cr.setStyleSheet('color: #888;')
+        foot.addWidget(cr, 0, C.Qt.AlignmentFlag.AlignRight | C.Qt.AlignmentFlag.AlignBottom)
+        lay.addLayout(foot)
+        self._show_controls()
+        self._set_matte_ui(False)
+
+    # ---- small helpers
+    def _toggles(self, label, names, slot):
+        h = W.QHBoxLayout()
+        h.addWidget(W.QLabel(label))
+        g = W.QButtonGroup(self)
+        g.setExclusive(True)
+        if not hasattr(self, '_tb'):
+            self._tb = {}
+        self._tb[label] = []
+        for i, nm in enumerate(names):
+            b = W.QPushButton(nm)
+            self._tb[label].append(b)
+            b.setCheckable(True)
+            g.addButton(b, i)
+            b.clicked.connect(lambda _=False, i=i: self._run(lambda: slot(i)))
+            h.addWidget(b)
+            if i == 0:
+                b.setChecked(True)
+        h.addStretch()
+        return h
+
+    def _run(self, fn):
+        try:
+            fn()
+        except Exception:
+            tb = traceback.format_exc()
+            nuke.tprint(tb)
+            self.result.setText(tb)
+
+    def _safe(self, fn):
+        return lambda *a: self._run(fn)
+
+    def put(self, r, col, text, ok=None):
+        it = W.QTableWidgetItem(str(text))
+        it.setFlags(C.Qt.ItemFlag.ItemIsSelectable | C.Qt.ItemFlag.ItemIsEnabled)
+        if ok is True:
+            it.setBackground(GOOD)
+        elif ok is False:
+            it.setBackground(BAD)
+        elif ok == 'warn':
+            it.setBackground(WARN)
+        self.t.setItem(r, COL[col], it)
+
+    def sel_rows(self):
+        return sorted(set(i.row() for i in self.t.selectedIndexes()))
+
+    def pair_nodes(self, r):
+        i, o = (self.t.item(r, 0).data(ROLE) or '|').split('|')
+        return (nuke.toNode(i) if i else None), (nuke.toNode(o) if o else None)
+
+    def _frame_for(self, n):
+        d = info(n)
+        return self.frame.value() or (d['first'] + d['last']) // 2
+
+    # ---- scan: build one row per Input/Output pair
+    def scan(self, only=None):
+        try:
+            reads = nuke.allNodes('Read', recurseGroups=True)
+        except Exception:
+            reads = nuke.allNodes('Read')
+        if not reads:
+            self.result.setText('No Read nodes found.')
+            return
+        pairs = find_pairs(reads)
+        rows, used = [], set()
+        for o in reads:
+            if o.fullName() in pairs:
+                inp = pairs[o.fullName()]
+                rows.append((inp, o))
+                if inp:
+                    used.add(inp.fullName())
+        for n in reads:
+            if n.fullName() not in pairs and n.fullName() not in used:
+                rows.append((n, None))                    # input with no output
+        if only:
+            rows = [(i, o) for i, o in rows
+                    if (i and i.fullName() in only) or (o and o.fullName() in only)]
+        rows.sort(key=lambda p: base_of(p[0] or p[1]))
+        self.t.setRowCount(0)
+        for inp, out in rows:
+            r = self.t.rowCount()
+            self.t.insertRow(r)
+            self.fill_row(r, inp, out)
+        self.t.resizeColumnsToContents()
+        self.result.setText('%d row(s).  Green = pass, red = fail.' % len(rows))
+
+    def scan_selected(self):
+        sel = set(n.fullName() for n in nuke.selectedNodes())
+        if not sel:
+            self.result.setText('Select Read nodes in the node graph first.')
+            return
+        self.scan(only=sel)
+
+    def fill_row(self, r, inp, out):
+        shot_src = inp or out
+        base = base_of(shot_src)
+        if not inp:
+            m = VER_RE.match(base)
+            base = m.group(1) if m else base
+        it = W.QTableWidgetItem(base)
+        it.setData(ROLE, '%s|%s' % (inp.fullName() if inp else '', out.fullName() if out else ''))
+        it.setFlags(C.Qt.ItemFlag.ItemIsSelectable | C.Qt.ItemFlag.ItemIsEnabled)
+        self.t.setItem(r, 0, it)
+        self.put(r, 'Input', inp.name() if inp else 'NOT FOUND', True if inp else False)
+        self.put(r, 'Output', out.name() if out else 'MISSING', True if out else False)
+        if not out:
+            return
+        try:
+            d = info(out)
+        except Exception:
+            tb = traceback.format_exc()
+            nuke.tprint(tb)
+            self.result.setText(tb)
+            self.put(r, 'Ver', 'ERROR', False)
+            return
+        isexr = d['ext'] == 'exr'
+        self.put(r, 'Ver', d['ver'], d['ver'] != '-')
+        self.put(r, 'Name', 'OK' if d['name_ok'] else 'BAD', d['name_ok'])
+        self.put(r, 'Ext', d['ext'], d['ext'] in ('exr', 'dpx'))
+        self.put(r, 'Compression', d['comp'] or '-',
+                 any(c in d['comp'].lower() for c in ALLOWED_COMP) if isexr else None)
+        self.put(r, 'Bits', d['bits'] or '-',
+                 any(b in d['bits'] for b in ALLOWED_BITS) if isexr else None)
+        self.put(r, 'Colorspace', d['cs'])
+        li = info(inp)['length'] if inp else None
+        self.put(r, 'Length', '%d (%d-%d)' % (d['length'], d['first'], d['last']) +
+                 ('' if li is None or li == d['length'] else '  (in %d)' % li),
+                 None if li is None else li == d['length'])      # only LENGTH is compared, not frame range
+        self.put(r, 'Start', d['first'], (d['first'] == START_FRAME) if CHECK_START else None)
+        self.put(r, 'Res', '%dx%d' % (d['w'], d['h']))
+        ob = d['bbox']
+        if inp:
+            ib = info(inp)['bbox']
+            exceed = ob[0] < ib[0] or ob[1] < ib[1] or ob[2] > ib[2] or ob[3] > ib[3]
+            self.put(r, 'BBox', '%d,%d,%d,%d' % ob, False if exceed else True)
+        else:
+            self.put(r, 'BBox', '%d,%d,%d,%d' % ob, True if ob == (0, 0, d['w'], d['h']) else 'warn')
+        self.put(r, 'DI Matte', ('%d: %s' % (len(d['mattes']), ', '.join(d['mattes']))) if d['mattes'] else '-')
+
+    def remove_missing(self):
+        n = 0
+        for r in reversed(range(self.t.rowCount())):
+            if not self.pair_nodes(r)[1]:
+                self.t.removeRow(r)
+                n += 1
+        self.result.setText('Removed %d row(s) with no output.' % n)
+
+    def remove_rows(self):
+        for r in reversed(self.sel_rows()):
+            self.t.removeRow(r)
+
+    # ---- numeric checks
+    def check_inout(self):
+        rows = self.sel_rows() or range(self.t.rowCount())
+        for r in rows:
+            inp, out = self.pair_nodes(r)
+            if not (inp and out):
+                continue
+            lines, short = compare(inp, out, self._frame_for(out))
+            bad = [l.split(' ')[0] for l in lines if 'MISMATCH' in l]
+            self.put(r, 'In/Out', 'OK' if not bad else 'MISMATCH: ' + ','.join(bad), not bad)
+            self.put(r, 'Length', '%d (%d-%d)' % (info(out)['length'], info(out)['first'], info(out)['last']),
+                     'Length' not in bad)
+            self.put(r, 'Diff', short or 'res mismatch', bool(short))
+            QtApp = W.QApplication.instance()
+            if QtApp:
+                QtApp.processEvents()
+        self.t.resizeColumnsToContents()
+
+    def run_analysis(self):
+        rows = self.sel_rows() or range(self.t.rowCount())
+        cmp_cols = (('black', 'Black', '%.4f'), ('white', 'White', '%.4f'),
+                    ('dark', 'Dark %', '%.2f'), ('bright', 'Bright %', '%.2f'), ('sat', 'Sat', '%.3f'),
+                    ('clip', 'Clip %', '%.3f'), ('grain', 'Grain', '%.3f'))
+        present_cols = (('neg', 'Neg %', '%.4f'), ('dead', 'Dead px', '%d'), ('super', 'Superbright %', '%.4f'))
+        for r in rows:
+            inp, out = self.pair_nodes(r)
+            if not out:
+                continue
+            f = self._frame_for(out)
+            so = analyse(out, f)
+            si = analyse(inp, f) if inp else None
+            for key, col, fmt in cmp_cols:          # must match input, else red
+                txt = fmt % so[key]
+                ok = None
+                if si:
+                    txt += '  (in ' + fmt % si[key] + ')'
+                    ok = same(key, so[key], si[key])
+                self.put(r, col, txt, ok)
+            for key, col, fmt in present_cols:      # present in output = red
+                txt = fmt % so[key]
+                if si:
+                    txt += '  (in ' + fmt % si[key] + ')'
+                self.put(r, col, txt, so[key] <= 0)
+            QtApp = W.QApplication.instance()
+            if QtApp:
+                QtApp.processEvents()
+        self.t.resizeColumnsToContents()
+        self.result.setText('Black = lowest pixel value, White = highest pixel value (RGB, file colorspace, '
+                            'float values not %). Red = output differs from input, or negative / dead / '
+                            'superbright pixels present.')
+
+    # ---- QC Tool: everything lives inside ONE group node
+    def tools(self):
+        return [t for t in (nuke.toNode(self.GRP + '.QC_In'), nuke.toNode(self.GRP + '.QC_Out')) if t]
+
+    def set_knob(self, path, knob, val):
+        for t in self.tools():
+            n = nuke.toNode(t.fullName() + '.' + path)
+            if n and knob in n.knobs():
+                n[knob].setValue(val)
+
+    def _show_controls(self):
+        for row in self.rows:
+            row.setVisible(row.method == self.method)
+        self.wipe.setVisible(self.view == 3)
+        self.dgain.setVisible(self.view == 2)
+
+    def set_method(self, i):
+        self.method = i
+        self._show_controls()
+        for t in self.tools():
+            t['QCMethod'].setValue(i)
+
+    def set_view(self, i):
+        self.view = i
+        self._show_controls()
+        sw = nuke.toNode(self.GRP + '.View_Switch')
+        if sw:
+            sw['which'].setValue(i)
+
+    def set_wipe(self, pct):
+        m, t = nuke.toNode(self.GRP + '.QC_WipeMask'), nuke.toNode(self.GRP + '.Plate')
+        if m and t:
+            m['expr0'].setValue('x>%d?1:0' % int(t.format().width() * pct / 100.0))
+
+    def set_dgain(self, v):
+        d = nuke.toNode(self.GRP + '.QC_DiffGain')
+        if d:
+            d['value'].setValue(v)
+
+    def _set_matte_ui(self, has):
+        """DI matte controls + Matte views only exist when the output has a DI matte"""
+        self.matte_box.setVisible(has)
+        for i in (4, 5):
+            self._tb['View:'][i].setVisible(has)
+        if not has and self.view >= 4:
+            self._tb['View:'][0].setChecked(True)
+            self.set_view(0)
+
+    def set_overlay(self):
+        m = nuke.toNode(self.GRP + '.Matte_Color')
+        if not m:
+            return
+        c = MATTE_COLORS.get(self.mcolor.currentText(), (1, 0, 0))
+        op = self.mop.value()
+        for i, v in enumerate((c[0] * op, c[1] * op, c[2] * op, 1.0)):
+            m['value'].setValue(v, i)
+
+    def refresh_mattes(self, rows):
+        self.matte.blockSignals(True)
+        self.matte.clear()
+        if rows:
+            _, out = self.pair_nodes(rows[0])
+            if out:
+                self.matte.addItems(find_mattes(out))
+        self.matte.blockSignals(False)
+        self._set_matte_ui(self.matte.count() > 0)
+        self.set_matte()
+
+    def set_matte(self):
+        """point the Matte view (inside QC_Compare) at the chosen matte layer"""
+        sh = nuke.toNode(self.GRP + '.Matte_View')
+        out = nuke.toNode(getattr(self, 'qc_out', '') or '')
+        layer = self.matte.currentText()
+        if not (sh and out and layer):
+            return
+        matte_copy(sh, layer)
+
+    def check_matte(self, all_mattes):
+        rows = self.sel_rows() or ([0] if self.t.rowCount() else [])
+        if not rows:
+            self.result.setText('Select a row first.')
+            return
+        _, out = self.pair_nodes(rows[0])
+        if not out:
+            self.result.setText('Row has no output.')
+            return
+        mattes = find_mattes(out) if all_mattes else [self.matte.currentText()]
+        mattes = [m for m in mattes if m]
+        if not mattes:
+            self.result.setText('No DI matte found in %s.' % out.name())
+            return
+        f = self._frame_for(out)
+        lines, any_bad = [], False
+        for m in mattes:
+            st = matte_stats(out, m, f)
+            problems = []
+            if st['cover'] <= 0:
+                problems.append('EMPTY')
+            if st['neg'] > 0:
+                problems.append('negative %.3f%%' % st['neg'])
+            if st['over'] > 0:
+                problems.append('>1 %.3f%%' % st['over'])
+            any_bad = any_bad or bool(problems)
+            lines.append('%s: coverage %.2f%%  mean %.4f  %s' % (
+                m, st['cover'], st['mean'],
+                'RED - ' + ', '.join(problems) if problems else 'OK'))
+        self.result.setText('\n'.join(lines))
+        if all_mattes:
+            self.put(rows[0], 'DI Matte', '%d: %s' % (len(mattes), ', '.join(mattes)), not any_bad)
+        self.t.resizeColumnsToContents()
+
+    def reset_sliders(self):
+        for row in self.rows:
+            row.set(row.default)
+        self.wipe.set(50)
+        self.dgain.set(10)
+
+    def remove_qc(self):
+        for g in nuke.allNodes('Group'):               # every QC_Compare* (also auto-renamed leftovers)
+            if g.name().startswith(self.GRP):
+                nuke.delete(g)                         # its input links go with it
+        self.qc_out = ''
+
+    def _paste_tool(self, src, name):
+        """paste QC_Tool group connected to src (call inside `with group:`)"""
+        for n in nuke.allNodes():
+            n.setSelected(False)
+        src.setSelected(True)
+        fd, tmp = tempfile.mkstemp(suffix='.nk')
+        with os.fdopen(fd, 'w') as f:
+            f.write(TOOL_NK)
+        try:
+            nuke.nodePaste(tmp)
+        finally:
+            os.remove(tmp)
+        grp = nuke.selectedNode()
+        grp['name'].setValue(name)
+        with grp:                                    # Dark gain target (slider)
+            cs, d3 = nuke.toNode('Colorspace1'), nuke.toNode('Dot3')
+            if cs and d3:
+                g = nuke.nodes.Grade(name='Dark_gain')
+                g.setInput(0, cs)
+                d3.setInput(0, g)
+        return grp
+
+    def build_qc(self, a, b):
+        self.remove_qc()
+        for n in nuke.allNodes():
+            n.setSelected(False)
+        grp = nuke.nodes.Group(name=self.GRP)
+        grp['tile_color'].setValue(0xff9900ff)
+        grp['hide_input'].setValue(True)               # no link arrows to the Reads
+        grp.setInput(0, a)
+        grp.setInput(1, b)
+        grp.setXYpos(b.xpos() + 120, b.ypos() + 60)
+        with grp:
+            ia = nuke.nodes.Input(name='Plate')
+            ia['number'].setValue(0)
+            ib = nuke.nodes.Input(name='Render')
+            ib['number'].setValue(1)
+            tin = self._paste_tool(ia, 'QC_In')
+            tout = self._paste_tool(ib, 'QC_Out')
+            diff = nuke.nodes.Merge2(inputs=[ia, ib], operation='difference', name='QC_Diff')
+            dg = nuke.nodes.Multiply(inputs=[diff], value=10, channels='rgb', name='QC_DiffGain')
+            mask = nuke.nodes.Expression(inputs=[tin], channel0='rgba', expr0='x>0?1:0', name='QC_WipeMask')
+            wipe = nuke.nodes.Keymix(inputs=[tin, tout, mask], name='QC_Wipe')
+            mv = nuke.nodes.Copy(inputs=[ib, ib], name='Matte_View')
+            col = nuke.nodes.Multiply(inputs=[mv], channels='rgb', name='Matte_Color')
+            ov = nuke.nodes.Merge2(inputs=[ia, col], operation='plus', name='Matte_On_Input')
+            sw = nuke.nodes.Switch(inputs=[tin, tout, dg, wipe, mv, ov], which=self.view,
+                                   name='View_Switch')
+            nuke.nodes.Output(inputs=[sw])
+        self.qc_out = b.fullName()
+        self.set_matte()
+        self.set_overlay()
+        for row, sp in zip(self.rows, SLIDERS):
+            self.set_knob(sp[1], sp[2], row.value())
+        for t in self.tools():
+            t['QCMethod'].setValue(self.method)
+        self.set_wipe(self.wipe.value())
+        self.set_dgain(self.dgain.value())
+        try:
+            nuke.connectViewer(0, grp)
+        except Exception:
+            nuke.tprint(traceback.format_exc())
+        self.result.setText('QC: %s (plate) vs %s (render). Use Check / View buttons + sliders.'
+                            % (a.name(), b.name()))
+
+    def qc_selected(self):
+        rows = self.sel_rows() or ([0] if self.t.rowCount() else [])
+        if not rows:
+            self.result.setText('Scan first and select a row.')
+            return
+        inp, out = self.pair_nodes(rows[0])
+        if not (inp and out):
+            self.result.setText('This row has no Input/Output pair.')
+            return
+        self.build_qc(inp, out)
+
+    # ---- graph <-> table selection sync
+    def _table_sel(self):
+        if self._busy:
+            return
+        self._busy = True
+        try:
+            rows = self.sel_rows()
+            self.refresh_mattes(rows)
+            if self.sync.isChecked():
+                for n in nuke.allNodes(recurseGroups=True):
+                    n.setSelected(False)
+                for r in rows:
+                    for n in self.pair_nodes(r):
+                        if n:
+                            n.setSelected(True)
+                self._last_sel = frozenset(n.fullName() for n in nuke.selectedNodes())
+            if self.auto.isChecked() and rows:
+                inp, out = self.pair_nodes(rows[0])
+                if inp and out:
+                    self.build_qc(inp, out)
+        except Exception:
+            nuke.tprint(traceback.format_exc())
+        finally:
+            self._busy = False
+
+    def _graph_sel(self):
+        if self._busy or not self.sync.isChecked() or not self.t.rowCount():
+            return
+        cur = frozenset(n.fullName() for n in nuke.selectedNodes())
+        if cur == self._last_sel:
+            return
+        self._last_sel = cur
+        self._busy = True
+        try:
+            self.t.blockSignals(True)
+            self.t.clearSelection()
+            for r in range(self.t.rowCount()):
+                if any(n and n.fullName() in cur for n in self.pair_nodes(r)):
+                    self.t.selectRow(r)
+        except Exception:
+            nuke.tprint(traceback.format_exc())
+        finally:
+            self.t.blockSignals(False)
+            self._busy = False
+
+    def showEvent(self, e):
+        nuke.addUpdateUI(self._graph_sel)
+        super(QCPanel, self).showEvent(e)
+
+    def hideEvent(self, e):
+        try:
+            nuke.removeUpdateUI(self._graph_sel)
+        except Exception:
+            pass
+        super(QCPanel, self).hideEvent(e)
+
+
+def register():
+    nukescripts.panels.registerWidgetAsPanel('qc_panel.QCPanel', 'QC Panel', 'studio.qc.panel')
